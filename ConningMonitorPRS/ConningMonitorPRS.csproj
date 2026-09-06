@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon />
+    <StartupObject>ConningMonitorPRS.Program</StartupObject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Windows.Forms.DataVisualization" Version="1.0.0-prerelease.20110.1" />
+    <PackageReference Include="System.IO.Ports" Version="8.0.0" />
+    <!-- Chart.OnPaint (System.Windows.Forms.DataVisualization) probes for System.Data.SqlClient
+         via reflection on first paint, even though nothing here uses SQL — on .NET 8 that
+         assembly isn't present by default and the probe throws FileNotFoundException, which
+         crashes any window hosting a Chart control (see TrendChartControl). Referencing the
+         package just makes the assembly resolvable so the probe succeeds; it is never used. -->
+    <PackageReference Include="System.Data.SqlClient" Version="4.8.6" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Config\config.json.example">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

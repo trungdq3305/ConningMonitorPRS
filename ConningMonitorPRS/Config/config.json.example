@@ -1,0 +1,17 @@
+{
+  "IsSimulationMode": true,
+  "IsLightTheme": false,
+  "AdminPassword": "123456",
+  "ShipName": "CONNING MONITOR",
+  "WindMax": 40.0,
+  "RMax": 3.0,
+  "PMax": 3.0,
+  "HMax": 2.0,
+  "Tasks": [
+    { "TaskName": "GPS",     "PortName": "COM1", "BaudRate": 9600, "SentenceType": "" },
+    { "TaskName": "WIND",    "PortName": "COM2", "BaudRate": 4800, "SentenceType": "" },
+    { "TaskName": "R/P/H",   "PortName": "COM3", "BaudRate": 9600, "SentenceType": "" },
+    { "TaskName": "HEADING", "PortName": "COM4", "BaudRate": 4800, "SentenceType": "" },
+    { "TaskName": "METEO",   "PortName": "COM5", "BaudRate": 9600, "SentenceType": "" }
+  ]
+}
