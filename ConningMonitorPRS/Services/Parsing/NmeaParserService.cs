@@ -20,6 +20,12 @@ namespace ConningMonitorPRS.Services.Parsing
         public event Action<string, int>?            OnGpsQualityParsed;  // port, quality
         public event Action<string, int, int>?        OnSatellitesParsed; // constellation, countInView, avgSnr
         public event Action<string, double, double, double>? OnGsaParsed;  // fixType, PDOP, HDOP, VDOP
+        // GGA fields beyond lat/lon/quality — satellites used (field 7), HDOP (field 8),
+        // DGPS correction age in seconds (field 13), reference station ID (field 14). Added
+        // for PRS-GNSS-01 (GNSS health module). Correction age/station ID are commonly blank
+        // outside DGPS/RTK mode — TryParse leaves them at NaN/"" rather than failing the whole
+        // sentence, since most of a GGA line is still useful without those two trailing fields.
+        public event Action<string, int, double, double, string>? OnGgaExtendedParsed; // port, satsUsed, hdop, dgpsAgeSec, stationId
 
         private readonly Dictionary<string, int> _errorCount = new();
         private readonly Dictionary<string, (int totalInView, int snrSum, int snrCount)> _gsvAccum = new();
@@ -140,6 +146,18 @@ namespace ConningMonitorPRS.Services.Parsing
                 }
                 if (p.Length >= 7 && int.TryParse(p[6], out int quality))
                     OnGpsQualityParsed?.Invoke(portName, quality);
+
+                // Extended fields — satellites used (7), HDOP (8), DGPS age (13), station ID
+                // (14). p.Length >= 6 already guaranteed by the branch guard above; each field
+                // beyond that is read independently so a short/truncated sentence still yields
+                // whatever trailing fields it does have instead of dropping all of them.
+                int    satsUsed   = (p.Length >= 8 && int.TryParse(p[7], out int su)) ? su : 0;
+                double hdopGga    = (p.Length >= 9 && double.TryParse(p[8], System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out double hd)) ? hd : double.NaN;
+                double dgpsAgeSec = (p.Length >= 14 && double.TryParse(p[13], System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out double age)) ? age : double.NaN;
+                string stationId  = (p.Length >= 15) ? p[14].Split('*')[0] : "";
+                OnGgaExtendedParsed?.Invoke(portName, satsUsed, hdopGga, dgpsAgeSec, stationId);
                 return;
             }
 

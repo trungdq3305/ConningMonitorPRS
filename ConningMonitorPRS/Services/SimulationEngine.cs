@@ -31,6 +31,16 @@ namespace ConningMonitorPRS.Services
         private const double StraightLegSeconds = 8.0;
         private const double TurnSeconds        = 6.0;
 
+        // PRS-GNSS-01 exercise cycles (2026-09-07) — GSA/GGA used to be static every tick
+        // (fix type always 3D, HDOP/PDOP/VDOP hardcoded, no correction-age/station-id data),
+        // which gave GnssHealthEvaluator nothing to react to in Simulation Mode. These three
+        // slow cycles are independent and layered on top of each other, not a scripted FAT
+        // scenario: HDOP/PDOP/VDOP drift on a ~2min sine (exercises H3's tier boundaries and
+        // H9's trend), a ~4s "lost fix" window recurs every 150s (exercises H1/H2/H7 ->
+        // INVALID then recovery), and a ~10s DGPS window recurs every 90s with correction age
+        // ramping 0->15->0s (exercises H5, which is otherwise always Unknown/standalone).
+        private double _simSecondsElapsed;
+
         public void Start(Action<string, string> callback)
         {
             _callback = callback;
@@ -62,7 +72,9 @@ namespace ConningMonitorPRS.Services
             string gpsPort     = PortFor("GPS",     "COM1");
             string windPort    = PortFor("WIND",    "COM2");
             string headingPort = PortFor("HEADING", "COM4");
+#if DUO_GPS_ENABLED
             string gps2Port    = PortFor("GPS2",    "COM6");
+#endif
 
             _phaseTimeSec += dtSec;
             if (!_turning)
@@ -122,18 +134,58 @@ namespace ConningMonitorPRS.Services
 
             string latStr = FormatDMM(_lat, true);
             string lonStr = FormatDMM(_lon, false);
-            _callback?.Invoke(gpsPort, AppendChecksum($"$GPGGA,120000.00,{latStr},N,{lonStr},E,1,08,1.0,10.0,M,,,,"));
+
+            _simSecondsElapsed += dtSec;
+
+            // ~2 minute sine, amplitude 0.8..5.0 — crosses every H3 tier boundary over a cycle.
+            double hdopSim = 2.9 + 2.1 * Math.Sin(_simSecondsElapsed * 2 * Math.PI / 120.0);
+            double pdopSim = hdopSim * 1.3;
+            double vdopSim = hdopSim * 0.9;
+
+            // Satellites used, 4..10 — offset phase so it doesn't just mirror HDOP 1:1.
+            int satsUsedSim = Math.Clamp(
+                (int)Math.Round(7 + 3 * Math.Sin(_simSecondsElapsed * 2 * Math.PI / 100.0 + 1.0)), 4, 10);
+
+            // ~4s "lost fix" window every 150s.
+            int cycleTicks  = _tickCount % 1500;
+            bool simLostFix = cycleTicks < 40;
+
+            // ~10s DGPS window every 90s, correction age ramping 0 -> 15 -> 0s.
+            int dgpsCycleTicks  = _tickCount % 900;
+            bool simDgpsWindow  = dgpsCycleTicks is >= 300 and < 400;
+            double dgpsAgeSim   = 0;
+            if (simDgpsWindow)
+            {
+                double frac = (dgpsCycleTicks - 300) / 100.0; // 0..1 across the window
+                dgpsAgeSim  = (frac < 0.5 ? frac * 2.0 : (1.0 - frac) * 2.0) * 15.0;
+            }
+
+            string qualityDigit = simLostFix ? "0" : simDgpsWindow ? "2" : "1";
+            string latField     = simLostFix ? "" : latStr;
+            string nsLatField   = simLostFix ? "" : "N";
+            string lonField     = simLostFix ? "" : lonStr;
+            string ewLonField   = simLostFix ? "" : "E";
+            string numSatsField = simLostFix ? "00" : satsUsedSim.ToString("00");
+            string hdopField    = simLostFix ? "99.9" : hdopSim.ToString("0.0");
+            string ageField     = simDgpsWindow ? dgpsAgeSim.ToString("0.0") : "";
+            string stationField = simDgpsWindow ? "0001" : "";
+
+            _callback?.Invoke(gpsPort, AppendChecksum(
+                $"$GPGGA,120000.00,{latField},{nsLatField},{lonField},{ewLonField},{qualityDigit},{numSatsField},{hdopField},10.0,M,,,{ageField},{stationField}"));
             // GNS sentence — same position, alongside GGA, so the new NmeaParserService GNS
             // branch is exercised in Simulation Mode (some real multi-constellation receivers
             // send only GNS, never GGA).
-            _callback?.Invoke(gpsPort, AppendChecksum($"$GPGNS,120000.00,{latStr},N,{lonStr},E,AA,08,1.0,10.0,M,,,"));
+            _callback?.Invoke(gpsPort, AppendChecksum(
+                $"$GPGNS,120000.00,{latField},{nsLatField},{lonField},{ewLonField},AA,{numSatsField},{hdopField},10.0,M,,,"));
             _callback?.Invoke(gpsPort, AppendChecksum($"$GPVTG,{_hdg:0.0},T,,M,{speed:0.00},N,,K,A"));
 
+#if DUO_GPS_ENABLED
             // Second GPS receiver (DUO mode, default port COM6) — a few metres off GPS1 and a
             // notch lower fix quality, so enabling DuoGpsEnabled has something real to compare.
             string lat2Str = FormatDMM(_lat + 0.00012, true);
             _callback?.Invoke(gps2Port, AppendChecksum($"$GPGGA,120000.00,{lat2Str},N,{lonStr},E,1,07,1.3,10.0,M,,,,"));
             _callback?.Invoke(gps2Port, AppendChecksum($"$GPVTG,{_hdg:0.0},T,,M,{speed:0.00},N,,K,A"));
+#endif
 
             // Simulate METEO via special tag
             double temp  = 28.0 + _rng.NextDouble() * 4;
@@ -148,8 +200,21 @@ namespace ConningMonitorPRS.Services
             {
                 SendGsv("GP", 10, 42, gpsPort);
                 SendGsv("GL", 8, 37, gpsPort);
-                _callback?.Invoke(gpsPort, AppendChecksum("$GPGSA,A,3,01,02,03,04,05,06,07,08,,,,,1.4,0.9,1.1"));
+                string gsaMode2 = simLostFix ? "1" : "3";
+                int    gsaSvCount = simLostFix ? 0 : Math.Min(8, satsUsedSim);
+                _callback?.Invoke(gpsPort, AppendChecksum(BuildGsa(gsaMode2, gsaSvCount, pdopSim, hdopSim, vdopSim)));
             }
+        }
+
+        private static string BuildGsa(string mode2, int svCount, double pdop, double hdop, double vdop)
+        {
+            var sb = new StringBuilder("$GPGSA,A,").Append(mode2);
+            for (int i = 0; i < 12; i++)
+                sb.Append(',').Append(i < svCount ? (i + 1).ToString("00") : "");
+            sb.Append(',').Append(pdop.ToString("0.0"));
+            sb.Append(',').Append(hdop.ToString("0.0"));
+            sb.Append(',').Append(vdop.ToString("0.0"));
+            return sb.ToString();
         }
 
         private void SendGsv(string talker, int totalInView, int baseSnr, string port)

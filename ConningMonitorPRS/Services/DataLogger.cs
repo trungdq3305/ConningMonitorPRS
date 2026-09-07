@@ -15,7 +15,8 @@ namespace ConningMonitorPRS.Services
 
         private static readonly string _header =
             "Time,Type,SpeedKnot,HeadingDeg,RollDeg,PitchDeg,HeaveCm,HeavePeriodSec," +
-            "WindSpeedMs,WindDirDeg,AlarmId,AlarmState,Value,Limit,Raw,GpsLat,GpsLon";
+            "WindSpeedMs,WindDirDeg,AlarmId,AlarmState,Value,Limit,Raw,GpsLat,GpsLon," +
+            "SatsUsed,Hdop,Pdop,Vdop,DgpsAgeSec,GnssOverall";
 
         public DataLogger()
         {
@@ -29,19 +30,37 @@ namespace ConningMonitorPRS.Services
         }
 
         public void LogSnapshot(double speed, double hdg, double roll, double pitch, double heave,
-            double period, double wSpd, double wDir, string lat, string lon)
+            double period, double wSpd, double wDir, string lat, string lon,
+            int satsUsed = 0, double hdop = double.NaN, double pdop = double.NaN,
+            double vdop = double.NaN, double dgpsAgeSec = double.NaN, string gnssOverall = "")
         {
             _queue.Enqueue(
                 $"{DateTime.Now:HH:mm:ss.fff},DATA," +
                 $"{speed:0.00},{hdg:0.0},{roll:0.0},{pitch:0.0},{heave:0.0},{period:0.0}," +
-                $"{wSpd:0.0},{wDir:0},,,,,,{lat},{lon}");
+                $"{wSpd:0.0},{wDir:0},,,,,,{lat},{lon}," +
+                $"{satsUsed},{hdop:0.00},{pdop:0.00},{vdop:0.00},{dgpsAgeSec:0.0},{gnssOverall}");
         }
 
         public void LogAlarmEvent(string evt, string id, string state, double value, double limit)
         {
             _queue.Enqueue(
                 $"{DateTime.Now:HH:mm:ss.fff},ALARM,,,,,,,,," +
-                $"{id},{state},{value:0.00},{limit:0.00},{evt},,");
+                $"{id},{state},{value:0.00},{limit:0.00},{evt},,,,,,,");
+        }
+
+        // PRS-GNSS-01 (and future PRS modules) rule/state transitions — the "Log Sự kiện" leg
+        // of the DP-OA handover doc's pipeline (section 1/12): every badge change on the HMI
+        // must be traceable back to a RuleID + metric + threshold + evidence (DoD #3). Reuses
+        // the same queue/flush/rotation/retention machinery as LogAlarmEvent above rather than
+        // standing up a separate logger.
+        public void LogRuleEvent(string ruleId, string channelId, string fromState, string toState,
+            double value, double? threshold, string evidence)
+        {
+            string safeEvidence = evidence.Replace(',', ';'); // keep it inside one CSV field
+            _queue.Enqueue(
+                $"{DateTime.Now:HH:mm:ss.fff},RULE,,,,,,,,," +
+                $"{ruleId},{toState},{value:0.00},{threshold?.ToString("0.00") ?? ""}," +
+                $"{channelId}:{fromState}->{toState}: {safeEvidence},,,,,,,");
         }
 
         private void Flush()

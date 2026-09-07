@@ -37,6 +37,8 @@ namespace ConningMonitorPRS.UI.Forms
         private DataListForm?  _dataListForm;
         private TargetsForm?   _targetsForm;
         private TrendsForm?    _trendsForm;
+        private SatelliteForm? _satelliteForm;
+        private PositionQualityForm? _positionQualityForm;
         private readonly ToolTip _cardTip = new();
 
         // ── Mini side panel (condensed radar + targets, always visible — see
@@ -50,15 +52,14 @@ namespace ConningMonitorPRS.UI.Forms
         private int           _miniTargetsTickCounter;
         private Label _miniRollVal = null!, _miniPitchVal = null!, _miniHeaveVal = null!;
         private string _cMiniRoll = "", _cMiniPitch = "", _cMiniHeave = "";
-        private TrendChartControl _miniTrend = null!;
 
         // ── Data labels ───────────────────────────────────────────────────────
         private Label _lblPosition  = null!;
         private Label _lblSpeed     = null!;
         private Label _lblSpeedUnit = null!;
         private Label _lblHeading   = null!;
-        private Label _lblWindSpd   = null!;
-        private Label _lblWindDir   = null!;
+        private Label _lblGnssMini  = null!;
+        private Label _lblPqeMini   = null!;
         private Label _lblClock     = null!;
 
         // POSITION card toggles lat/lon ⇄ UTM on click; SPEED card toggles kn ⇄ m/s.
@@ -75,7 +76,14 @@ namespace ConningMonitorPRS.UI.Forms
         // ── Alarm tags ────────────────────────────────────────────────────────
         private Tag _windTag = null!, _rollTag = null!, _pitchTag = null!, _heaveTag = null!;
         private Tag _driftTag = null!;
+#if DUO_GPS_ENABLED
         private Tag _gpsDuoTag = null!;
+#endif
+        private Tag _gnssSeverityTag = null!;
+        private Tag _pqeSeverityTag  = null!;
+        private GnssHealthEvaluator _gnssHealthEvaluator = null!;
+        private PqeEvaluator        _pqeEvaluator         = null!;
+        private DpOaCore            _dpOaCore            = null!;
 
         // ── Timers ────────────────────────────────────────────────────────────
         private System.Windows.Forms.Timer _uiTimer     = null!;
@@ -102,8 +110,11 @@ namespace ConningMonitorPRS.UI.Forms
             public bool HasFix => !double.IsNaN(LatDeg) && !double.IsNaN(LonDeg)
                                 && (DateTime.Now - LastUpdate).TotalSeconds < 5.0;
         }
-        private readonly GpsSource _gps1 = new(), _gps2 = new();
+        private readonly GpsSource _gps1 = new();
+#if DUO_GPS_ENABLED
+        private readonly GpsSource _gps2 = new();
         private int _activeGpsSource = 1; // 1 or 2 — sticky, only changes on a clear quality win
+#endif
 
         // Once the app has run this long without crashing, the crash-loop guard in
         // Program.cs is reset — a transient crash shouldn't slow down the *next* one.
@@ -112,7 +123,7 @@ namespace ConningMonitorPRS.UI.Forms
         private bool _crashGuardCleared;
 
         // ── Value cache (skip repaint when text unchanged) ────────────────────
-        private string _cPos = "", _cSpd = "", _cHdg = "", _cWSpd = "", _cWDir = "";
+        private string _cPos = "", _cSpd = "", _cHdg = "", _cGnssMini = "", _cPqeMini = "";
 
         // ── CardPanel: fills background from Palette at paint-time ───────────
         private sealed class CardPanel : Panel
@@ -374,8 +385,20 @@ namespace ConningMonitorPRS.UI.Forms
                 else _dataListForm.BringToFront();
             };
 
+            var btnGnss = MakeButton("🛰  GNSS HEALTH", Palette.BtnPrimaryBg, Palette.BtnPrimaryFg);
+            btnGnss.Location = new Point(340, 7);
+            btnGnss.Width    = 170;
+            btnGnss.Click   += (s, e) => OpenSatelliteForm();
+
+            var btnPqe = MakeButton("📶  POSITION QUALITY", Palette.BtnPrimaryBg, Palette.BtnPrimaryFg);
+            btnPqe.Location = new Point(510, 7);
+            btnPqe.Width    = 190;
+            btnPqe.Click   += (s, e) => OpenPositionQualityForm();
+
             bar.Controls.Add(btnSettings);
             bar.Controls.Add(btnScan);
+            bar.Controls.Add(btnGnss);
+            bar.Controls.Add(btnPqe);
             return bar;
         }
 
@@ -398,6 +421,37 @@ namespace ConningMonitorPRS.UI.Forms
             }
             else _trendsForm.BringToFront();
         }
+
+        // Shared by the bottom-bar buttons and the mini GNSS HEALTH/POSITION QUALITY cards on
+        // the left panel (see BuildLeftPanel) — both entry points open the same window.
+        private void OpenSatelliteForm()
+        {
+            if (_satelliteForm == null || _satelliteForm.IsDisposed)
+            {
+                _satelliteForm = new SatelliteForm();
+                _satelliteForm.Show(this);
+            }
+            else _satelliteForm.BringToFront();
+        }
+
+        private void OpenPositionQualityForm()
+        {
+            if (_positionQualityForm == null || _positionQualityForm.IsDisposed)
+            {
+                _positionQualityForm = new PositionQualityForm();
+                _positionQualityForm.Show(this);
+            }
+            else _positionQualityForm.BringToFront();
+        }
+
+        private static Color ColorForHealthState(HealthState s) => s switch
+        {
+            HealthState.Healthy  => Palette.OkFg,
+            HealthState.Degraded => Palette.WaitFg,
+            HealthState.Warning  => Palette.WaitFg,
+            HealthState.Invalid  => Palette.LostFg,
+            _                    => Palette.TextDim,
+        };
 
         // ── Left panel: ship name + 2-column card grid ────────────────────────
         private Panel BuildLeftPanel()
@@ -448,16 +502,24 @@ namespace ConningMonitorPRS.UI.Forms
                 () => { _showSpeedMs = !_showSpeedMs; _lblSpeedUnit.Text = _showSpeedMs ? "m/s" : "kn"; _cSpd = ""; },
                 "Click to toggle kn ⇄ m/s");
 
-            // WIND SPD | WIND DIR
-            grid.Controls.Add(BuildDataCard("WIND SPD", "m/s", isMultiLine: false, out _lblWindSpd, out _, out _), 0, 2);
-            grid.Controls.Add(BuildDataCard("WIND DIR", "°",   isMultiLine: false, out _lblWindDir, out _, out _),  1, 2);
+            // GNSS HEALTH | POSITION QUALITY — mini summary cards for PRS-GNSS-01/PRS-PQE-01
+            // (replaced WIND SPD/DIR here 2026-09-07; wind is still visible via the top-bar
+            // WIND badge, DataListForm, and TrendsForm's Wind mode). "⤢" glyph (not the default
+            // "⇄") since clicking opens a window, not toggling a unit/format.
+            var cardGnss = BuildDataCard("GNSS HEALTH", "", isMultiLine: false, out _lblGnssMini, out _, out var titleGnss, clickable: true, clickGlyph: "⤢", longText: true);
+            grid.Controls.Add(cardGnss, 0, 2);
+            MakeCardClickable(cardGnss, titleGnss, _lblGnssMini, null, OpenSatelliteForm, "Click to open GNSS Health");
+
+            var cardPqe = BuildDataCard("POSITION QUALITY", "", isMultiLine: false, out _lblPqeMini, out _, out var titlePqe, clickable: true, clickGlyph: "⤢", longText: true);
+            grid.Controls.Add(cardPqe, 1, 2);
+            MakeCardClickable(cardPqe, titlePqe, _lblPqeMini, null, OpenPositionQualityForm, "Click to open Position Quality");
 
             outer.Controls.Add(grid);
             outer.Controls.Add(lblShip);
             return outer;
         }
 
-        private Panel BuildDataCard(string title, string unit, bool isMultiLine, out Label valLabel, out Label unitLabel, out Label titleLabel, bool clickable = false)
+        private Panel BuildDataCard(string title, string unit, bool isMultiLine, out Label valLabel, out Label unitLabel, out Label titleLabel, bool clickable = false, string clickGlyph = "⇄", bool longText = false)
         {
             var card = new CardPanel { Dock = DockStyle.Fill, Margin = new Padding(4) };
 
@@ -527,7 +589,7 @@ namespace ConningMonitorPRS.UI.Forms
                     using var iconFont = new Font("Segoe UI", badgeSize * 0.5f, FontStyle.Bold);
                     using var iconBrush = new SolidBrush(Palette.ClickHint);
                     using var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-                    g.DrawString("⇄", iconFont, iconBrush, badgeRect, fmt);
+                    g.DrawString(clickGlyph, iconFont, iconBrush, badgeRect, fmt);
                 }
             };
 
@@ -536,9 +598,16 @@ namespace ConningMonitorPRS.UI.Forms
                 if (card.Height < 10 || card.Width < 10) return;
                 int h = card.Height, w = card.Width;
 
-                int titleH = Math.Max(26, Math.Min((int)(h * 0.24f), 40));
+                // longText titles ("POSITION QUALITY") are long enough to wrap to a second line
+                // at the normal font/height — smaller font (fits on one line) + a bit more
+                // height as a safety margin in case it wraps anyway.
+                int titleH = longText
+                    ? Math.Max(30, Math.Min((int)(h * 0.30f), 46))
+                    : Math.Max(26, Math.Min((int)(h * 0.24f), 40));
                 lblTitle.Height = titleH;
-                SafeFont(lblTitle, Math.Max(9f, Math.Min(h * 0.095f, 15f)));
+                SafeFont(lblTitle, longText
+                    ? Math.Max(8f, Math.Min(h * 0.075f, 12f))
+                    : Math.Max(9f, Math.Min(h * 0.095f, 15f)));
 
                 if (hasUnit)
                 {
@@ -547,9 +616,15 @@ namespace ConningMonitorPRS.UI.Forms
                     SafeFont(lblUnit, Math.Max(10f, Math.Min(h * 0.100f, 16f)));
                 }
 
-                float vf = isMultiLine
-                    ? Math.Max(10f, Math.Min(Math.Min(h * 0.15f, w * 0.068f), 22f))
-                    : Math.Max(14f, Math.Min(Math.Min(h * 0.30f, w * 0.20f),  46f));
+                // longText: full state words (HEALTHY/DEGRADED/WARNING/INVALID/UNKNOWN) are much
+                // wider per character than the 2-4 digit numbers the formulas below were tuned
+                // for — at the normal (isMultiLine:false) scale, a half-width card renders them
+                // clipped ("HEALTHY" → "HEAL"). Smaller width-driven cap instead.
+                float vf = longText
+                    ? Math.Max(9f, Math.Min(Math.Min(h * 0.14f, w * 0.055f), 18f))
+                    : isMultiLine
+                        ? Math.Max(10f, Math.Min(Math.Min(h * 0.15f, w * 0.068f), 22f))
+                        : Math.Max(14f, Math.Min(Math.Min(h * 0.30f, w * 0.20f),  46f));
                 SafeFont(lblVal, vf);
             };
 
@@ -593,12 +668,10 @@ namespace ConningMonitorPRS.UI.Forms
             // RadarControl preview used to sit here too, but was removed 2026-08-28 — it
             // duplicated the RANGE/WIND/DRIFT corner readouts now drawn directly on
             // ConningControl and looked visually inconsistent next to it. A mini
-            // TrendChartControl (R/P/H) was added just below the Radar/Trends button instead
-            // — see BuildMiniTrendChart() — reversing an earlier "don't embed the chart here"
-            // decision; that control still carries the DataVisualization gotchas documented
-            // above (SqlClient workaround, manual ChartArea %), and running a second instance
-            // alongside TrendsForm's own does cost extra render/CPU, but the user asked for it
-            // directly and that tradeoff is now accepted.
+            // TrendChartControl (R/P/H) briefly lived just below the Radar/Trends button too,
+            // but was removed 2026-09-07 to make room for the GNSS HEALTH/POSITION QUALITY
+            // mini cards on the left panel instead (see BuildMiniSidePanel/BuildLeftPanel) —
+            // full R/P/H trend detail is still one click away via the TRENDS button.
             var split = new TableLayoutPanel
             {
                 Dock        = DockStyle.Fill,
@@ -618,9 +691,12 @@ namespace ConningMonitorPRS.UI.Forms
         }
 
         // Tiles row (ROLL/PITCH/HEAVE) + a slim Radar/Trends button (mini radar picture
-        // removed, see BuildRadarTrendsButtonRow) + mini Roll/Pitch/Heave trend chart + mini
-        // targets list. Same live data the full TrendsForm/TargetsForm windows show, just
-        // condensed; clicking the targets card opens the full window.
+        // removed, see BuildRadarTrendsButtonRow) + mini targets list. Same live data the full
+        // TrendsForm/TargetsForm windows show, just condensed; clicking the targets card opens
+        // the full window. The mini R/P/H trend chart that used to sit here was removed
+        // 2026-09-07 (to make room for the GNSS HEALTH/POSITION QUALITY cards on the left
+        // panel instead — full detail is still one click away via the TRENDS button) — mini
+        // targets now takes the entire remaining height instead of splitting it 55/45.
         private Panel BuildMiniSidePanel()
         {
             // BackColor = CardBg (not AppBg) so this whole strip reads as one unified panel,
@@ -630,36 +706,17 @@ namespace ConningMonitorPRS.UI.Forms
             {
                 Dock        = DockStyle.Fill,
                 ColumnCount = 1,
-                RowCount    = 4,
+                RowCount    = 3,
                 BackColor   = Palette.CardBg,
                 Padding     = new Padding(2)
             };
             side.RowStyles.Add(new RowStyle(SizeType.Absolute, 96F)); // ROLL/PITCH/HEAVE tiles
             side.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F)); // Radar/Trends button (mini radar picture removed)
-            side.RowStyles.Add(new RowStyle(SizeType.Percent, 55F));  // mini R/P/H trend chart
-            side.RowStyles.Add(new RowStyle(SizeType.Percent, 45F));  // mini targets
-            side.Controls.Add(BuildMiniMotionTiles(),        0, 0);
-            side.Controls.Add(BuildRadarTrendsButtonRow(),   0, 1);
-            side.Controls.Add(BuildMiniTrendChart(),         0, 2);
-            side.Controls.Add(BuildMiniTargetsCard(),        0, 3);
+            side.RowStyles.Add(new RowStyle(SizeType.Percent, 100F)); // mini targets (all remaining height)
+            side.Controls.Add(BuildMiniMotionTiles(),      0, 0);
+            side.Controls.Add(BuildRadarTrendsButtonRow(), 0, 1);
+            side.Controls.Add(BuildMiniTargetsCard(),      0, 2);
             return side;
-        }
-
-        // Roll/Pitch/Heave motion trend, locked to Motion mode (no mode-switch/time-window
-        // toolbar — that lives in the full TrendsForm window; this is a glance-only preview).
-        // User explicitly asked for this despite the earlier "don't embed TrendChartControl
-        // here" decision (see BuildRightPanel's comment) — the double render/CPU cost of a
-        // second Chart instance alongside TrendsForm's own is now an accepted tradeoff.
-        private Panel BuildMiniTrendChart()
-        {
-            var card = new CardPanel { Dock = DockStyle.Fill, Margin = new Padding(3) };
-            _miniTrend = new TrendChartControl { Dock = DockStyle.Fill };
-            // Shorter than TrendsForm's own 1-minute default — this panel is much narrower, so
-            // 1 minute of points read as a dense, hard-to-follow squiggle; 30s spreads the same
-            // ~100ms-cadence data across fewer on-screen points, making the lines easier to read.
-            _miniTrend.SetViewWindow(0.5);
-            card.Controls.Add(_miniTrend);
-            return card;
         }
 
         // Two custom from-scratch attempts at these 3 tiles (a ClockLabel-based value label,
@@ -882,16 +939,32 @@ namespace ConningMonitorPRS.UI.Forms
             _pitchTag = new Tag("Pitch");
             _heaveTag = new Tag("Heave");
             _driftTag  = new Tag("DriftDistance");
+#if DUO_GPS_ENABLED
             _gpsDuoTag = new Tag("GpsDuoDivergence");
+#endif
+            _gnssSeverityTag = new Tag("GnssSeverity");
+            _pqeSeverityTag  = new Tag("PqeSeverity");
             _alarmEngine.Register(new Alarm("AL_WIND",   _windTag,   () => SystemConfig.WindMax,  () => SystemConfig.WindConfirmSeconds));
             _alarmEngine.Register(new Alarm("AL_ROLL",   _rollTag,   () => SystemConfig.RMax,     () => SystemConfig.MotionConfirmSeconds));
             _alarmEngine.Register(new Alarm("AL_PITCH",  _pitchTag,  () => SystemConfig.PMax,     () => SystemConfig.MotionConfirmSeconds));
             _alarmEngine.Register(new Alarm("AL_HEAVE",  _heaveTag,  () => SystemConfig.HMax,     () => SystemConfig.MotionConfirmSeconds));
             _alarmEngine.Register(new Alarm("AL_DRIFT",  _driftTag,  () => SystemConfig.DriftRadiusM));
+#if DUO_GPS_ENABLED
             _alarmEngine.Register(new Alarm("AL_GPSDUO", _gpsDuoTag, () => SystemConfig.GpsDuoDivergenceM));
+#endif
+            // Severity ordinals: Degraded=1, Warning=2, Invalid=3 (see HealthState.Severity) —
+            // AL_GNSS_WARNING trips at Warning-or-worse, AL_GNSS_INVALID only at Invalid.
+            _alarmEngine.Register(new Alarm("AL_GNSS_WARNING", _gnssSeverityTag, () => 1.5));
+            _alarmEngine.Register(new Alarm("AL_GNSS_INVALID", _gnssSeverityTag, () => 2.5));
+            _alarmEngine.Register(new Alarm("AL_PQE_WARNING", _pqeSeverityTag, () => 1.5));
+            _alarmEngine.Register(new Alarm("AL_PQE_INVALID", _pqeSeverityTag, () => 2.5));
             _alarmEngine.AlarmRaised  += OnAlarmRaised;
             _alarmEngine.AlarmCleared += OnAlarmCleared;
             _alarmEngine.AlarmAcked   += OnAlarmAcked;
+
+            _gnssHealthEvaluator = new GnssHealthEvaluator();
+            _pqeEvaluator        = new PqeEvaluator();
+            _dpOaCore            = new DpOaCore(_logger);
 
             _nmeaParser = new NmeaParserService { HeaveArm = HeaveArm };
             _nmeaParser.SetPortTasks(ConfigForm.Tasks);
@@ -936,6 +1009,12 @@ namespace ConningMonitorPRS.UI.Forms
             };
             _nmeaParser.OnSatellitesParsed += (constellation, count, avgSnr) => ConningDataHub.Instance.UpdateSatellites(constellation, count, avgSnr);
             _nmeaParser.OnGsaParsed += (fixType, pdop, hdop, vdop) => ConningDataHub.Instance.UpdateGsa(fixType, pdop, hdop, vdop);
+            // PRS-GNSS-01 input — satellites used, DGPS correction age/station ID from GGA.
+            _nmeaParser.OnGgaExtendedParsed += (port, satsUsed, hdopGga, dgpsAgeSec, stationId) =>
+            {
+                if (GpsSourceForPort(port) != ActiveGpsSource()) return;
+                ConningDataHub.Instance.UpdateGgaExtended(satsUsed, dgpsAgeSec, stationId);
+            };
 
             _comEngine = new ComEngine();
             _comEngine.OnDataReceived += OnComData;
@@ -1013,16 +1092,23 @@ namespace ConningMonitorPRS.UI.Forms
             _nmeaParser?.Parse(port, raw);
         }
 
-        // ── DUO GPS: source lookup, selection, publish ────────────────────────
+        // ── GPS: source lookup, publish ────────────────────────────────────────
+        // Was "DUO GPS: source lookup, selection, publish" — GPS2/dual-source selection
+        // disabled 2026-09-07 (single-GPS only), see #if DUO_GPS_ENABLED below and
+        // CLAUDE.md "DUO GPS mode". GpsSourceForPort/ActiveGpsSource still exist (always
+        // resolving to _gps1) so OnPositionParsed/OnCogParsed/etc. below don't need to change.
         private GpsSource? GpsSourceForPort(string portName)
         {
             var t = ConfigForm.Tasks.Find(x => x.PortName == portName);
             if (t == null) return null;
             if (t.TaskName == "GPS")  return _gps1;
+#if DUO_GPS_ENABLED
             if (t.TaskName == "GPS2") return _gps2;
+#endif
             return null;
         }
 
+#if DUO_GPS_ENABLED
         private GpsSource ActiveGpsSource() => _activeGpsSource == 2 ? _gps2 : _gps1;
 
         // RTK fixed > RTK float > DGPS > GPS/PPS; estimated/manual/simulation (6/7/8) and
@@ -1049,6 +1135,10 @@ namespace ConningMonitorPRS.UI.Forms
             if (r1 != r2) _activeGpsSource = r1 > r2 ? 1 : 2;
             // else: tie — keep current source (sticky, avoids flip-flopping on equal quality)
         }
+#else
+        private GpsSource ActiveGpsSource() => _gps1;
+        private void SelectActiveGpsSource() { /* single GPS — nothing to select */ }
+#endif
 
         private void PublishActiveGps()
         {
@@ -1056,8 +1146,12 @@ namespace ConningMonitorPRS.UI.Forms
             ConningDataHub.Instance.UpdateGpsData(src.SpeedKnot, src.LatStr, src.LonStr);
             if (!double.IsNaN(src.LatDeg) && !double.IsNaN(src.LonDeg))
                 ConningDataHub.Instance.UpdateGpsRaw(src.LatDeg, src.LonDeg);
+#if DUO_GPS_ENABLED
             ConningDataHub.Instance.UpdateGpsFixQuality(
                 SystemConfig.DuoGpsEnabled ? $"{src.QualityText}·{_activeGpsSource}" : src.QualityText);
+#else
+            ConningDataHub.Instance.UpdateGpsFixQuality(src.QualityText);
+#endif
         }
 
         // ═════════════════════════════════════════════════════════════════════
@@ -1074,9 +1168,11 @@ namespace ConningMonitorPRS.UI.Forms
             _driftTag.Update(SystemConfig.DriftWatchEnabled && hasFix
                 ? GeoMath.DistanceMeters(SystemConfig.DriftRefLat, SystemConfig.DriftRefLon, snap.GpsLatDeg, snap.GpsLonDeg)
                 : 0);
+#if DUO_GPS_ENABLED
             _gpsDuoTag.Update(SystemConfig.DuoGpsEnabled && _gps1.HasFix && _gps2.HasFix
                 ? GeoMath.DistanceMeters(_gps1.LatDeg, _gps1.LonDeg, _gps2.LatDeg, _gps2.LonDeg)
                 : 0);
+#endif
             _alarmEngine.Evaluate();
 
             // Clock
@@ -1104,11 +1200,21 @@ namespace ConningMonitorPRS.UI.Forms
             string hdg = $"{snap.Heading:000.0}";
             if (hdg != _cHdg) { _lblHeading.Text = hdg; _cHdg = hdg; }
 
-            // Wind
-            string wspd = $"{snap.WindSpeedMs:0.0}";
-            string wdir = $"{snap.WindDirDeg:000}";
-            if (wspd != _cWSpd) { _lblWindSpd.Text = wspd; _cWSpd = wspd; }
-            if (wdir != _cWDir) { _lblWindDir.Text = wdir; _cWDir = wdir; }
+            // GNSS HEALTH / POSITION QUALITY mini cards (left panel) — evaluators run at 1Hz
+            // (MainForm.HealthTick), so most 100ms ticks skip the repaint via the text-diff
+            // cache below, same as every other card here.
+            string gnssMini = snap.GnssHealth?.Overall.ToString().ToUpperInvariant() ?? "—";
+            if (gnssMini != _cGnssMini)
+            {
+                _lblGnssMini.Text = gnssMini; _cGnssMini = gnssMini;
+                _lblGnssMini.ForeColor = ColorForHealthState(snap.GnssHealth?.Overall ?? HealthState.Unknown);
+            }
+            string pqeMini = snap.PqeStatus?.Overall.ToString().ToUpperInvariant() ?? "—";
+            if (pqeMini != _cPqeMini)
+            {
+                _lblPqeMini.Text = pqeMini; _cPqeMini = pqeMini;
+                _lblPqeMini.ForeColor = ColorForHealthState(snap.PqeStatus?.Overall ?? HealthState.Unknown);
+            }
 
             // Mini ROLL/PITCH/HEAVE tiles (side panel)
             string mr = $"{snap.RollDeg:0.0}";
@@ -1117,8 +1223,6 @@ namespace ConningMonitorPRS.UI.Forms
             if (mr != _cMiniRoll)  { _miniRollVal.Text  = mr; _cMiniRoll  = mr; }
             if (mp != _cMiniPitch) { _miniPitchVal.Text = mp; _cMiniPitch = mp; }
             if (mh != _cMiniHeave) { _miniHeaveVal.Text = mh; _cMiniHeave = mh; }
-            _miniTrend.PushMotionData(snap.RollDeg, snap.PitchDeg, snap.HeaveCm);
-            _miniTrend.Render();
 
             // ConningControl — carries the RANGE/DRIFT corner readouts (ZOOM merged into RANGE
             // 2026-09-03, WIND corner removed earlier), own-ship track, and target shapes that
@@ -1234,13 +1338,30 @@ namespace ConningMonitorPRS.UI.Forms
                     case "HEADING": UpdateBadge(_badgeHdg,    "HDG",   row); break;
                 }
             }
+
+            // PRS-GNSS-01 → LÕI DP-OA: evaluate H1-H9, hand the result to DpOaCore (which
+            // logs any state transitions and publishes to ConningDataHub for the HMI), then
+            // feed the overall severity to the existing Alarm/Tag machinery.
+            var gnssStatus = _gnssHealthEvaluator.Evaluate(snap);
+            _dpOaCore.IngestGnssStatus(gnssStatus);
+            _gnssSeverityTag.Update(gnssStatus.Overall == HealthState.Unknown
+                ? 0 : gnssStatus.Overall.Severity());
+
+            // PRS-PQE-01 → LÕI DP-OA — same pattern as GNSS above; DpOaCore also recomputes
+            // the combined GNSS×PQE interpretation (doc section 8) once both have reported.
+            var pqeStatus = _pqeEvaluator.Evaluate(snap);
+            _dpOaCore.IngestPqeStatus(pqeStatus);
+            _pqeSeverityTag.Update(pqeStatus.Overall == HealthState.Unknown
+                ? 0 : pqeStatus.Overall.Severity());
         }
 
         private void LogTick(object? sender, EventArgs e)
         {
             var snap = ConningDataHub.Instance.GetSnapshot();
             _logger.LogSnapshot(snap.GpsSpeedKnot, snap.Heading, snap.RollDeg, snap.PitchDeg,
-                snap.HeaveCm, snap.HeavePeriodSec, snap.WindSpeedMs, snap.WindDirDeg, snap.GpsLat, snap.GpsLon);
+                snap.HeaveCm, snap.HeavePeriodSec, snap.WindSpeedMs, snap.WindDirDeg, snap.GpsLat, snap.GpsLon,
+                snap.SatsUsed, snap.Hdop, snap.Pdop, snap.Vdop, snap.DgpsAgeSec,
+                snap.GnssHealth?.Overall.ToString() ?? "");
         }
 
         // ── Alarm handlers ─────────────────────────────────────────────────────

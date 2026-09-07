@@ -25,25 +25,36 @@ ConningMonitorPRS/
 │   │   └── UtmConverter.cs           # WGS84 lat/lon → UTM (zone/band/easting/northing)
 │   └── Models/
 │       ├── AppConfig.cs             # JSON-serialisable config (Tasks + alarm limits + vessel params
-│       │                             # + Position Watch + Targets + DUO GPS)
+│       │                             # + Position Watch + Targets + DUO GPS [#if] + PRS-GNSS-01 + PRS-PQE-01)
 │       ├── DeviceTask.cs            # TaskName, PortName, BaudRate, SentenceType
 │       ├── SystemConfig.cs          # Static runtime config (IsLight, IsSimMode, WindMax, Loa,
-│       │                             # DriftWatch*, Targets, DuoGps*…)
+│       │                             # DriftWatch*, Targets, DuoGps* [#if], Gnss*…, Pqe*…)
 │       ├── TargetPoint.cs           # Name/Lat/Lon/Enabled + ExtraPoints (List<LatLon>, tối đa 3
 │       │                             # đỉnh nữa) — up to 4 target, dùng cho Targets window
 │       ├── LatLon.cs                # Lat/Lon đơn giản — dùng cho TargetPoint.ExtraPoints
-│       ├── Alarm.cs / AlarmState.cs # Alarm model
-│       └── Tag.cs                   # UI alarm tag
+│       ├── Alarm.cs / AlarmState.cs # Alarm model (binary Normal/Active/Acknowledged)
+│       ├── Tag.cs                   # UI alarm tag
+│       ├── HealthState.cs           # PRS-GNSS-01/PQE-01: graded Unknown/Healthy/Degraded/Warning/Invalid
+│       ├── PersistenceTimer.cs      # PRS-GNSS-01: on-delay confirm timer, factored out of Alarm.Evaluate()
+│       ├── RuleResult.cs            # PRS-GNSS-01/PQE-01: 1 channel verdict (RuleID/metric/threshold/evidence)
+│       ├── GnssHealthStatus.cs      # PRS-GNSS-01: aggregate Overall + Channels(H1-H9) + Advisories
+│       └── PqeStatus.cs             # PRS-PQE-01: aggregate Overall + Channels(Q1-Q8) + Advisories
 ├── Services/
 │   ├── ComEngine.cs                 # Opens SerialPorts, fires OnDataReceived(portName, line)
 │   │                                 # MRU/METEO ports: skip DataReceived + inactivity timeout,
 │   │                                 # expose GetManagedPort() for MruService/MeteoService to borrow
 │   ├── Parsing/
 │   │   └── NmeaParserService.cs     # Parses HDT / MWV / CNTB / PRDID / PASHR / GGA / VTG / GSV / GSA
-│   │                                 # Các event liên quan GPS đều mang theo portName (xem mục DUO GPS)
+│   │                                 # Các event liên quan GPS đều mang theo portName (xem mục DUO GPS,
+│   │                                 # hiện #if DUO_GPS_ENABLED). OnGgaExtendedParsed cho PRS-GNSS-01.
 │   ├── AlarmEngine.cs               # Register / Evaluate / Ack alarms
+│   ├── GnssHealthEvaluator.cs       # PRS-GNSS-01 — rule engine H1-H9, xem mục riêng cùng tên
+│   ├── PqeEvaluator.cs              # PRS-PQE-01 — rule engine Q1-Q8, xem mục riêng cùng tên
+│   ├── DpOaCore.cs                  # LÕI DP-OA — nhận status từ 2 module PRS, log transition, đẩy hub,
+│   │                                 # tính Combined interpretation (mục 8 tài liệu)
 │   ├── ConfigService.cs             # Load/Save config.json
-│   ├── DataLogger.cs                # Periodic CSV logging, giữ log 90 ngày (LogRetentionDays)
+│   ├── DataLogger.cs                # Periodic CSV logging, giữ log 90 ngày (LogRetentionDays) —
+│   │                                 # + LogRuleEvent() cho PRS-GNSS-01/PRS-PQE-01/DpOaCore
 │   ├── MeteoService.cs              # Optional meteo sensor (simulation-only, no real Modbus wired)
 │   ├── MruService.cs                # Sole source of Roll/Pitch/Heave — Xsens MTi XBus binary
 │   │                                 # (MTData2) on COM3 @115200. Sim mode: internal 100ms timer.
@@ -62,9 +73,10 @@ ConningMonitorPRS/
 │   │                                 # theo view window đã chọn. Hiển thị trong TrendsForm.
 │   ├── Forms/
 │   │   ├── MainForm.cs              # Root form — layout + service wiring + DUO GPS source selection
-│   │   ├── ConfigForm.cs            # Password-protected settings form (4 tab: Alarm Limits,
-│   │   │                             # COM Config, Alarm History, Position Watch — target editing
-│   │   │                             # moved out entirely 2026-09-03, xem TargetsForm)
+│   │   ├── ConfigForm.cs            # Password-protected settings form (6 tab: Alarm Limits,
+│   │   │                             # COM Config, Alarm History, Position Watch, GNSS Health,
+│   │   │                             # Position Quality — target editing moved out entirely
+│   │   │                             # 2026-09-03, xem TargetsForm)
 │   │   ├── DataListForm.cs          # DATA LIST window — raw NMEA theo từng port/task
 │   │   ├── TargetsForm.cs           # Cửa sổ TARGETS — nơi DUY NHẤT sửa target (lên tới 300, 6 toạ
 │   │   │                             # độ/target — 2026-09-03) — bearing/distance sống + trạng thái
@@ -72,7 +84,9 @@ ConningMonitorPRS/
 │   │   │                             # login, nút ADD TARGET, xem mục Position Watch & Targets)
 │   │   ├── TrendsForm.cs            # Cửa sổ TRENDS — chỉ còn TrendChartControl (radar đã gộp
 │   │   │                             # hết vào ConningControl, 2026-08-28)
-│   │   ├── SatelliteForm.cs         # Cửa sổ SATELLITES — số vệ tinh/SNR theo constellation + DOP
+│   │   ├── SatelliteForm.cs         # Cửa sổ "GNSS HEALTH / SATELLITE STATUS" — số vệ tinh/SNR theo
+│   │   │                             # constellation + DOP, + badge H1-H9 (PRS-GNSS-01) + dòng Combined
+│   │   ├── PositionQualityForm.cs   # Cửa sổ POSITION QUALITY — badge Q1-Q8 (PRS-PQE-01) + dòng Combined
 │   │   └── LoginForm.cs             # Admin login (password = SystemConfig.AdminPassword)
 │   └── Theme/
 │       └── Palette.cs               # All colours (dark/light), IsLight toggle
@@ -205,6 +219,8 @@ field 15-17 = PDOP/HDOP/VDOP.
 |------------------|--------------------------------------------|
 | ⚙ SETTINGS       | `ConfigForm` (yêu cầu login admin)        |
 | 📋 DATA LIST      | `DataListForm` — raw NMEA từng port        |
+| 🛰 GNSS HEALTH    | `SatelliteForm` — PRS-GNSS-01 (2026-09-07, nút mở lại sau khi bị ẩn — xem mục "PRS-GNSS-01") |
+| 📶 POSITION QUALITY | `PositionQualityForm` — PRS-PQE-01 (2026-09-07, xem mục "PRS-PQE-01") |
 
 TARGETS **không còn nút riêng ở bottom bar** — mở bằng cách bấm trực tiếp vào mini Targets card ở cột
 phải (xem bên dưới), cursor đổi thành tay + tooltip khi hover, cùng kiểu tương tác với
@@ -213,9 +229,9 @@ phải (xem bên dưới), cursor đổi thành tay + tooltip khi hover, cùng k
 `Label`). RADAR/TRENDS mở bằng 1 `Button` riêng (`BuildRadarTrendsButtonRow`) trong cột phải — xem
 mục "Cột phải" ngay dưới về lý do không còn hình radar thu nhỏ ở đây nữa.
 
-Nút "🛰 SATELLITES" (mở `SatelliteForm`) đã bị bỏ khỏi bottom bar — code `SatelliteForm.cs` và phần
-parse `$GSV`/`$GSA` vẫn còn nguyên trong `NmeaParserService`, chỉ ẩn lối vào UI (xem mục "Các lỗi đã
-biết" cuối file).
+Nút "🛰 SATELLITES" (mở `SatelliteForm`) từng bị bỏ khỏi bottom bar — **đã thêm lại (2026-09-07)** dưới
+tên "🛰 GNSS HEALTH" khi `SatelliteForm` được mở rộng cho PRS-GNSS-01 (xem mục "PRS-GNSS-01"), vì module
+health mới cần 1 lối vào UI thật để người dùng xem được. Không còn là mục trong "Các lỗi đã biết".
 
 Cả 3 form phụ (DataListForm/TargetsForm/TrendsForm) đều **non-modal, tự chủ**: có `Timer` riêng
 đọc thẳng từ `ConningDataHub.Instance.GetSnapshot()`, không phụ thuộc `MainForm._uiTimer`. Chart/track buffer
@@ -744,6 +760,18 @@ theo `portName` gốc (`OnPositionParsed`, `OnPositionRawParsed`, `OnSpeedParsed
 - Alarm `AL_GPSDUO` (Tag `GpsDuoDivergence`, limit `SystemConfig.GpsDuoDivergenceM`, mặc định 50m) — tính
   khoảng cách Haversine giữa 2 nguồn mỗi tick khi cả 2 đều có fix; raise khi lệch quá ngưỡng.
 
+**Đã tắt (2026-09-07), code vẫn còn nguyên:** theo yêu cầu người dùng ("bỏ GPS2, dùng 1 GPS, nhưng
+comment lại chứ không xoá, phòng dùng lại sau"), toàn bộ kiến trúc mô tả ở trên (task `GPS2`,
+`_gps2`/`_activeGpsSource`, `SelectActiveGpsSource`/`QualityRank`, `AL_GPSDUO`/`_gpsDuoTag`, checkbox
+"Enable DUO GPS mode" + divergence numeric trong ConfigForm ▸ COM Config, khối GPS2 trong
+`SimulationEngine`, 2 property `DuoGpsEnabled`/`GpsDuoDivergenceM` trong `AppConfig`/`SystemConfig`) đã
+bị bọc trong `#if DUO_GPS_ENABLED ... #endif` — **không xoá**, chỉ compile-out. App hiện tại chỉ có 1
+nguồn GPS (`_gps1`, task `"GPS"`, COM1 mặc định); `GpsSourceForPort`/`ActiveGpsSource` vẫn còn (đơn giản
+hoá còn luôn trả `_gps1`) để `OnPositionParsed`/`OnCogParsed`/... không cần sửa gì thêm. Muốn bật lại:
+thêm `<DefineConstants>DUO_GPS_ENABLED</DefineConstants>` vào `ConningMonitorPRS.csproj`, không cần sửa
+code nào khác. `config.json` cũ còn field `DuoGpsEnabled`/`GpsDuoDivergenceM`/task `"GPS2"` vẫn load
+được bình thường (System.Text.Json bỏ qua property lạ, vòng lặp merge task no-op khi không khớp tên).
+
 ---
 
 ## Position Watch & Targets
@@ -1056,12 +1084,155 @@ nữa** (radar panel đã bị gộp/xoá 2026-08-28, giờ chỉ còn 1 `TrendC
 
 ## Satellite Status
 
-`SatelliteForm` (không còn nút mở trong bottom bar, xem mục "Giao diện chính"). Parse `$GSV` (số vệ tinh nhìn thấy + SNR trung bình theo từng
+`SatelliteForm` — **đã có nút mở lại trong bottom bar** ("🛰 GNSS HEALTH", 2026-09-07, xem mục
+"PRS-GNSS-01" ngay dưới — form này giờ gộp cả satellite status cũ lẫn health mới, đổi tên hiển thị
+thành "GNSS HEALTH / SATELLITE STATUS"). Parse `$GSV` (số vệ tinh nhìn thấy + SNR trung bình theo từng
 constellation, gộp qua nhiều sentence trong 1 chu kỳ) và `$GSA` (fix type 2D/3D + PDOP/HDOP/VDOP) trong
 `NmeaParserService`. Màu dòng: xanh lá SNR≥35dB, trắng 20-35dB, đỏ <20dB hoặc dữ liệu cũ >5s.
 
 ⚠️ **Không phải** vệ tinh phát tín hiệu hiệu chỉnh vi sai (differential correction / SBAS) như một số DGNSS
 display chuyên dụng khác — cần bản tin độc quyền của hãng receiver, ngoài phạm vi NMEA-0183 chuẩn.
+
+---
+
+## PRS-GNSS-01 (GNSS Health module — DP-OA handover doc, module 1/2)
+
+Tích hợp đầu tiên trong bộ tài liệu bàn giao "DP Operator Assistant" (2 module: PRS-GNSS-01 tình trạng
+GNSS/DGPS + PRS-PQE-01 chất lượng vị trí — **cả 2 module đã triển khai**, xem mục "PRS-PQE-01" ngay
+dưới). Bám sát sơ đồ pipeline của tài liệu (mục 1): `Máy thu GNSS/DGPS → PRS-GNSS-01 → LÕI DP-OA →
+Khuyến cáo cho DPO/HMI → Log Sự kiện + Dữ liệu Thô` — tách thành 3 lớp riêng biệt thay vì gộp tắt:
+
+- **`Services/Parsing/NmeaParserService.cs`** — thêm event `OnGgaExtendedParsed(port, satsUsed, hdopGga,
+  dgpsAgeSec, stationId)`, đọc thêm field 7 (satellites used)/8 (HDOP)/13 (tuổi hiệu chỉnh vi sai)/14
+  (mã trạm tham chiếu) của `$GGA` — trước đây parser chỉ đọc tới field 6 (fix quality). Field 13/14
+  thường rỗng ngoài chế độ DGPS/RTK, `TryParse` an toàn trả về `NaN`/`""` thay vì fail cả sentence.
+- **`Services/GnssHealthEvaluator.cs`** (PRS-GNSS-01) — rule engine **thuần tính toán**, không tự ghi
+  hub/log/Tag. `Evaluate(Snapshot)` → `GnssHealthStatus` (9 kênh H1-H9 + Overall + Advisories). Ánh xạ:
+  | Kênh | Nguồn dữ liệu | Ghi chú |
+  |---|---|---|
+  | H1 Data availability | tuổi `TaskRows["GPS"]`, ngưỡng `SystemConfig.GnssDataTimeoutSeconds` | on-delay qua `PersistenceTimer` |
+  | H2 Position solution | `GsaFixType` (3D/2D/NO FIX) | |
+  | H3 Satellite geometry | `Hdop`/`Pdop`, tier `GnssHdop*`/`GnssPdop*` | worst-of 2 chỉ số |
+  | H4 Constellation | đếm constellation có `CountInView>0` trong `Satellites` (từ GSV) | **xấp xỉ** — GSA không tách theo constellation trong app này |
+  | H5 Differential correction | `DgpsAgeSec`, chỉ đánh giá khi `GpsFixQuality` là DGPS/RTK | standalone → UNKNOWN (đúng ý tài liệu) |
+  | H6 Receiver/antenna | — | **luôn UNKNOWN** — cần bản tin độc quyền hãng, ngoài phạm vi NMEA-0183 |
+  | H7 Data link | cùng tuổi `TaskRows["GPS"]` như H1 nhưng ngưỡng ×3 | xem hạn chế bên dưới |
+  | H8 Position integrity | so độ lệch vị trí thật (Haversine) vs độ lệch ngụ ý từ SOG mỗi tick | `GnssPositionJumpWarningM` |
+  | H9 Trend | rolling buffer 10 mẫu HDOP/SatsUsed (1 mẫu/giây) | Degraded nếu xu hướng xấu dần liên tục |
+- **`Services/DpOaCore.cs`** (LÕI DP-OA) — nhận `GnssHealthStatus` từ evaluator mỗi giây
+  (`MainForm.HealthTick`), so từng kênh với lần trước để phát hiện chuyển trạng thái → gọi
+  `DataLogger.LogRuleEvent` cho mỗi lần đổi (RuleID/kênh/from/to/value/threshold/evidence) → rồi mới
+  `ConningDataHub.UpdateGnssHealth(status)` cho HMI đọc. Từ khi có PRS-PQE-01 (module 2, `IngestPqeStatus`
+  — xem mục "PRS-PQE-01" ngay dưới), class này còn tính `RecomputeCombined()` áp bảng kết hợp mục 8 tài
+  liệu (GNSS×PQE → 1 thông điệp) mỗi khi 1 trong 2 module báo cáo.
+- **`Core/Models/HealthState.cs`/`RuleResult.cs`/`GnssHealthStatus.cs`/`PersistenceTimer.cs`** — model
+  dùng chung: `enum HealthState { Unknown, Healthy, Degraded, Warning, Invalid }` (Unknown **không phải**
+  Healthy — không có dữ liệu thì hiện rõ là không có dữ liệu, không tự nâng lên Healthy), `RuleResult`
+  (1 kênh, luôn kèm RuleID/metric/threshold/evidence để truy vết), `PersistenceTimer` (tách từ cơ chế
+  on-delay của `Alarm.Evaluate()`, dùng chung cho H1-H5 thay vì chép tay).
+- **Alarm/Tag** — `AL_GNSS_WARNING`/`AL_GNSS_INVALID` (Tag `GnssSeverity`, ordinal 0-3 từ
+  `HealthState.Severity()`) đăng ký y hệt các alarm khác trong `MainForm.InitServices()`, tái dùng
+  nguyên `Alarm`/`AlarmEngine`/confirm-delay/hysteresis đã có — không phải cơ chế báo động mới.
+- **Config** (4 lớp `AppConfig`→`SystemConfig`→`ConfigForm`→consumer, đúng pattern
+  `MotionConfirmSeconds`) — tất cả ngưỡng H1/H3/H5/H8 đều cấu hình được ở ConfigForm ▸ tab **"GNSS
+  Health"** mới: `GnssDataTimeoutSeconds`, `GnssConfirmSeconds`, `GnssHdopDegraded/Warning/Invalid`,
+  `GnssPdopDegraded/Invalid`, `GnssCorrectionAgeDegraded/Warning/Invalid`, `GnssPositionJumpWarningM`.
+- **UI** — `SatelliteForm` mở rộng (xem mục "Satellite Status" ở trên): badge Overall + bảng 9 kênh +
+  advisory WHAT/WHY/IMPACT/ACTION của cảnh báo nghiêm trọng nhất, phía trên grid vệ tinh cũ. Nút mở lại
+  trong bottom bar (`_satelliteForm`, cùng pattern `_dataListForm`).
+- **Log** — `DataLogger.LogRuleEvent(...)` (dòng CSV `Type=RULE`, tái dùng đúng hạ tầng queue/flush 10s/
+  xoay file 30 phút/dọn >90 ngày của `LogAlarmEvent`) ghi mọi lần chuyển trạng thái kênh; `LogSnapshot`
+  thêm cột `SatsUsed,Hdop,Pdop,Vdop,DgpsAgeSec,GnssOverall` vào dòng `DATA` định kỳ (`MainForm.LogTick`).
+- **Simulation** — `SimulationEngine` thêm 3 chu kỳ độc lập chồng lên nhau (không phải kịch bản FAT có
+  kịch bản): HDOP/PDOP/VDOP dao động sin ~2 phút biên độ 0.8-5.0 (test tier H3/xu hướng H9), cửa sổ mất
+  fix ~4s mỗi 150s (test H1/H2/H7 → INVALID rồi hồi phục), cửa sổ DGPS ~10s mỗi 90s với tuổi hiệu chỉnh
+  tăng/giảm 0→15→0s (test H5, vốn luôn UNKNOWN ở chế độ standalone).
+
+**Hạn chế đã biết (ghi rõ, không che giấu):**
+- H6 luôn UNKNOWN — không có bản tin độc quyền hãng để đánh giá receiver/antenna qua NMEA-0183 chuẩn.
+- H4 là xấp xỉ (đếm constellation có SV nhìn thấy qua GSV), không phải breakdown "used-in-fix" thật theo
+  từng constellation — `NmeaParserService`'s GSA không gắn tag constellation.
+- H1 và H7 hiện dùng **chung 1 timestamp** (`ConningDataHub._lastUpdate["GPS"]`, bị ghi đè bởi cả
+  `UpdateGpsData` lẫn `UpdateRawString`) — chỉ khác ngưỡng (H1 ngắn/H7 dài gấp 3), chưa phải 2 tín hiệu
+  độc lập thật (cần hub tách riêng "tuổi fix hợp lệ" vs "tuổi raw NMEA" nếu muốn tách hẳn sau này).
+- Chỉ 1 nguồn GPS (DUO đã tắt, xem mục "DUO GPS mode") — health hiện tại là của nguồn GPS duy nhất,
+  không có per-receiver breakdown.
+
+---
+
+## PRS-PQE-01 (Position Quality module — DP-OA handover doc, module 2/2)
+
+Module thứ hai, hoàn tất bộ tài liệu bàn giao DP-OA cùng PRS-GNSS-01 ở trên. Đánh giá **hành vi thực
+tế** của luồng vị trí (nhiễu, trôi, nhảy vọt, đóng băng, tính nhất quán động) — độc lập với việc máy
+thu GNSS có "báo khoẻ" hay không (1 PRS có thể HEALTHY ở PRS-GNSS-01 nhưng WARNING ở đây, và ngược
+lại — đúng tinh thần mục 8 tài liệu). Không đọc thêm NMEA — tiêu thụ thẳng luồng vị trí đã chuẩn hoá
+sẵn có trong `ConningDataHub.Snapshot` (`GpsLatDeg/GpsLonDeg/GpsSpeedKnot`), đúng sơ đồ `Máy thu GNSS/
+DGPS → Vị trí Thô/Đã chuẩn hóa → PRS-PQE-01 → LÕI DP-OA → Khuyến cáo DPO/HMI → Log`.
+
+- **`Services/PqeEvaluator.cs`** — rule engine **thuần tính toán** (không tự ghi hub/log/Tag), cùng
+  hợp đồng với `GnssHealthEvaluator`: `Evaluate(Snapshot)` → `PqeStatus` (8 kênh Q1-Q8 + Overall +
+  Advisories), gọi mỗi giây từ `MainForm.HealthTick` ngay sau khối GNSS. Pipeline nội bộ: chiếu vị trí
+  sang mét cục bộ (`GeoMath.OffsetMeters`, origin chốt ở fix hợp lệ đầu tiên) → tiền lọc trung vị (5
+  mẫu) → lọc nhanh (EMA τ≈5s) + lọc chậm (EMA τ≈60s) → residual = trung vị − lọc nhanh → RMS(30s)/
+  R95(60s) từ buffer residual 60s → drift từ buffer lọc chậm 65s → jump/freeze từ so sánh tick liên
+  tiếp trừ displacement kỳ vọng theo SOG → vận tốc suy ra so với SOG.
+  | Kênh | Nguồn dữ liệu | Ghi chú |
+  |---|---|---|
+  | Q1 Input data quality | tuổi `TaskRows["GPS"]`, ngưỡng `SystemConfig.GnssDataTimeoutSeconds` | không qua warm-up, tính riêng trong `PqeEvaluator` (không phụ thuộc PRS-GNSS-01) |
+  | Q2 Short-term noise | RMS(30s) của residual | tier `PqeRms30*` |
+  | Q3 Position stability | R95(60s) của residual | tier `PqeR95*` |
+  | Q4 Drift | tốc độ dịch chuyển tâm lọc chậm (m/phút) + hướng (atan2 cục bộ) | tier `PqeDrift*` |
+  | Q5 Jump/Freeze | worst-of(jump tier, freeze state) | jump tier `PqeJump*`; freeze `PqeFreezeThresholdM` — tích luỹ displacement ngụ ý từ SOG trong lúc vị trí không đổi |
+  | Q6 Dynamic consistency | \|vận tốc suy ra − SOG\| | tier `PqeVelMismatch*` — **SOG cùng nguồn GPS đang đánh giá, không phải log/gyro độc lập thật** |
+  | Q7 Cross-PRS consistency | — | **luôn UNKNOWN** — chỉ 1 nguồn vị trí (DUO tắt), đúng H6 pattern của PRS-GNSS-01 |
+  | Q8 Trend quality | đếm Q2/Q3/Q4/Q5/Q6 không Healthy | ≥3 kênh suy giảm cùng lúc → Warning |
+  Warm-up: Q2/Q3/Q4/Q5/Q6/Q8 UNKNOWN cho tới đủ `SystemConfig.PqeWarmupSamples` mẫu (mặc định 30, ~30s
+  ở nhịp 1Hz của `HealthTick`) — Q1/Q7 không qua warm-up.
+- **`Services/DpOaCore.cs`** — `IngestPqeStatus(PqeStatus)` (song song `IngestGnssStatus`, cùng cơ chế
+  log-transition-rồi-publish-hub qua `UpdatePqeStatus`). Sau mỗi lần 1 trong 2 module `Ingest*`,
+  `RecomputeCombined()` chạy (chỉ khi **cả 2** đã báo cáo ít nhất 1 lần) — `BuildCombinedText(gnss,
+  pqe)` áp bảng mục 8 tài liệu (Healthy+Healthy, Degraded+Healthy, Healthy+Warning "tình huống quan
+  trọng", Warning+Warning, Unknown+*, *+Unknown, + 1 nhánh mặc định worst-of-severity cho tổ hợp tài
+  liệu không liệt kê) → `ConningDataHub.UpdateCombinedStatus(text, severity)`.
+- **`Core/Models/PqeStatus.cs`** — cùng hình dạng `GnssHealthStatus` (Overall/Channels/Advisories),
+  tái dùng nguyên `HealthState`/`RuleResult`/`Advisory`/`PersistenceTimer` từ PRS-GNSS-01, không có
+  base type chung (2 class nhỏ, không đáng thêm interface).
+- **Alarm/Tag** — `AL_PQE_WARNING`/`AL_PQE_INVALID` (Tag `PqeSeverity`), đăng ký y hệt
+  `AL_GNSS_WARNING`/`AL_GNSS_INVALID`.
+- **Config** — tab **"Position Quality"** mới trong `ConfigForm` (`SetupPositionQualityTab`):
+  `PqeWarmupSamples`, `PqeRms30Degraded/Warning/Invalid`, `PqeR95Degraded/Warning/Invalid`,
+  `PqeDriftDegraded/Warning/Invalid`, `PqeJumpDegraded/Warning/Invalid`, `PqeFreezeThresholdM`,
+  `PqeVelMismatchDegradedKn/WarningKn`. **Bug layout đã phát hiện & sửa cùng lúc**: tab "GNSS Health"
+  (thêm ở PRS-GNSS-01) xếp nội dung tới `Top=517`, vượt quá chiều cao khả dụng của dialog 640×500
+  (~406px) — phần Correction Age Warning/Invalid bị cắt mất, không kéo tới được vì `Panel` không tự
+  cuộn. Fix: thêm `AutoScroll = true` cho cả `pnlGnss` lẫn `pnlPqe` (tab Position Quality cũng dài
+  tương tự, 2 cột `Left=30`/`340` + 1 nhóm phụ Q6 xếp dưới ở `Top=419`).
+- **UI** — `UI/Forms/PositionQualityForm.cs` (mới, non-modal, Timer 1000ms riêng, theo đúng pattern
+  `SatelliteForm`/`DataListForm`/`TargetsForm`/`TrendsForm`): badge Overall + bảng 8 kênh Q1-Q8 +
+  advisory WHAT/WHY/IMPACT/ACTION nghiêm trọng nhất + 1 dòng **"Combined"** (đọc
+  `Snapshot.CombinedText`/`CombinedSeverity`). Theo yêu cầu người dùng (2026-09-07), đây là **cửa sổ
+  riêng**, không gộp vào `SatelliteForm` — nhưng `SatelliteForm` cũng được thêm cùng 1 dòng "Combined"
+  (dưới badge Overall của nó) để dù DPO mở cửa sổ nào trước cũng thấy ngay ý nghĩa kết hợp GNSS×PQE.
+  Nút mở trong bottom bar: **"📶 POSITION QUALITY"** (`_positionQualityForm`, cùng pattern
+  `_satelliteForm`).
+- **Log** — tái dùng `DataLogger.LogRuleEvent(...)` y hệt PRS-GNSS-01, không cần sửa gì thêm (đã
+  generic theo `channelId`/`ruleId`). **Không** mở rộng cột `DATA` định kỳ cho RMS/R95/drift ở lần
+  tích hợp này (khác PRS-GNSS-01) — Q1-Q8 đã đủ truy vết qua `LogRuleEvent` mỗi lần đổi trạng thái;
+  để lại như polish tuỳ chọn nếu cần export số liệu PQE liên tục sau này.
+- **Simulation** — không sửa `SimulationEngine` cho module này; chuyển động dead-reckoning + jitter
+  heading/SOG đã có sẵn (xem PRS-GNSS-01) đủ để RMS(30s)/R95(60s) không phải hằng số 0 chết cứng, và
+  các cửa sổ mất-fix/DGPS mô phỏng của PRS-GNSS-01 tự nhiên kích hoạt Q5 (freeze, khi vị trí đứng yên
+  trong lúc GSA báo NO FIX) — không cần kịch bản mô phỏng riêng cho PQE.
+
+**Hạn chế đã biết (ghi rõ, không che giấu):**
+- Q7 luôn UNKNOWN — chỉ 1 nguồn vị trí (DUO GPS đã tắt), không có gì để so sánh chéo.
+- Q6 dùng `GpsSpeedKnot` ($VTG) từ **cùng** máy thu GPS đang được đánh giá, không phải nguồn tham
+  chiếu chuyển động độc lập thật (gyro log/EM log) như tài liệu hình dung — vẫn hữu ích để bắt lỗi nội
+  tại luồng vị trí, không phải kiểm tra chéo độc lập hoàn toàn.
+- Không có biểu đồ tán xạ "đám mây vị trí" (tài liệu mục 12 gợi ý) — chỉ bảng + advisory text, nhất
+  quán với quyết định phạm vi V1 đã áp dụng cho PRS-GNSS-01.
+- `LogSnapshot` (dòng `DATA` định kỳ) chưa có cột RMS/R95/drift — chỉ `LogRuleEvent` (dòng `RULE`) ghi
+  lại các lần chuyển trạng thái Q1-Q8.
 
 ---
 
@@ -1090,9 +1261,22 @@ GpsOffset), **COM Config** (bảng port/baud + DUO GPS toggle), **Alarm History*
 | DriftRefLat/Lon     | 0.0      | Toạ độ điểm tham chiếu (độ thập phân)    |
 | DriftRadiusM        | 500.0    | Bán kính vùng an toàn (m)                |
 | Targets             | []       | Tối đa 300 `TargetPoint` (Name/Lat/Lon/Enabled/ExtraPoints — tối đa 5 tọa độ phụ, xem `TargetsForm`) |
-| DuoGpsEnabled       | false    | Bật GPS2 làm nguồn dự phòng              |
-| GpsDuoDivergenceM   | 50.0     | Ngưỡng cảnh báo lệch giữa GPS1/GPS2 (m)  |
-| Tasks               | []       | Danh sách DeviceTask (port, baud, type), bao gồm GPS2 |
+| DuoGpsEnabled       | false    | **Tắt (`#if DUO_GPS_ENABLED`), xem mục "DUO GPS mode"** — bật GPS2 làm nguồn dự phòng |
+| GpsDuoDivergenceM   | 50.0     | **Tắt (`#if DUO_GPS_ENABLED`)** — ngưỡng cảnh báo lệch giữa GPS1/GPS2 (m) |
+| GnssDataTimeoutSeconds | 3.0   | PRS-GNSS-01 H1/H7 — tuổi dữ liệu GPS tối đa trước khi INVALID |
+| GnssConfirmSeconds  | 2.0      | PRS-GNSS-01 H1-H5 — thời gian duy trì trước khi đổi trạng thái |
+| GnssHdopDegraded/Warning/Invalid | 1.5/2.5/4.0 | PRS-GNSS-01 H3 — tier HDOP |
+| GnssPdopDegraded/Invalid | 2.5/4.0 | PRS-GNSS-01 H3 — tier PDOP |
+| GnssCorrectionAgeDegraded/Warning/Invalid | 5/10/20 | PRS-GNSS-01 H5 — tuổi hiệu chỉnh vi sai (s) |
+| GnssPositionJumpWarningM | 3.0  | PRS-GNSS-01 H8 — ngưỡng nhảy vọt vị trí bất thường (m) |
+| PqeWarmupSamples    | 30       | PRS-PQE-01 — số mẫu khởi động trước khi Q2-Q6/Q8 hết UNKNOWN |
+| PqeRms30Degraded/Warning/Invalid | 0.5/1.0/2.0 | PRS-PQE-01 Q2 — tier nhiễu ngắn hạn RMS(30s) (m) |
+| PqeR95Degraded/Warning/Invalid | 1.0/2.0/3.0 | PRS-PQE-01 Q3 — tier độ ổn định R95(60s) (m) |
+| PqeDriftDegraded/Warning/Invalid | 0.10/0.25/0.50 | PRS-PQE-01 Q4 — tier tốc độ trôi (m/phút) |
+| PqeJumpDegraded/Warning/Invalid | 1.0/2.0/3.0 | PRS-PQE-01 Q5 — tier nhảy vọt (m) |
+| PqeFreezeThresholdM | 0.2      | PRS-PQE-01 Q5 — ngưỡng displacement ngụ ý để coi là đóng băng (m) |
+| PqeVelMismatchDegradedKn/WarningKn | 0.3/0.8 | PRS-PQE-01 Q6 — tier lệch vận tốc suy ra vs SOG (knot) |
+| Tasks               | []       | Danh sách DeviceTask (port, baud, type) — GPS2 đã tắt, xem mục "DUO GPS mode" |
 
 ### Cấu hình baudrate mỗi COM (trong ConfigForm ▸ COM Config)
 Có thể thay đổi port name và baud rate cho từng task (GPS / WIND / MRU / HEADING / aux / GPS2).
@@ -1120,7 +1304,11 @@ việc chính thao tác gán `row.Cells["Port"].Value = ...` bên trong swap l�
 
 `AlarmEngine` đánh giá `List<Alarm>` mỗi tick (100ms, `MainForm._uiTimer`).  
 Các alarm được register trong `MainForm.InitServices()`: `AL_WIND`, `AL_ROLL`, `AL_PITCH`, `AL_HEAVE`,
-`AL_DRIFT` (Position Watch, xem mục riêng), `AL_GPSDUO` (DUO GPS divergence, xem mục riêng).  
+`AL_DRIFT` (Position Watch, xem mục riêng), `AL_GPSDUO` (DUO GPS divergence — **tắt, `#if
+DUO_GPS_ENABLED`**, xem mục "DUO GPS mode"), `AL_GNSS_WARNING`/`AL_GNSS_INVALID` (PRS-GNSS-01 overall
+severity, Tag `GnssSeverity` cập nhật mỗi giây từ `DpOaCore.CurrentGnssStatus.Overall`, xem mục
+"PRS-GNSS-01"), `AL_PQE_WARNING`/`AL_PQE_INVALID` (PRS-PQE-01 overall severity, Tag `PqeSeverity`, xem
+mục "PRS-PQE-01").  
 States: `Normal` → `Active` (raised) → `Acked` → `Normal` (cleared).  
 UI badge nhấp nháy khi Active, màu vàng khi Acked.
 
@@ -1268,8 +1456,13 @@ dotnet build -c Release
 - `XsensDetector.FindPort()` chưa được gọi tự động từ UI — cần wire thủ công vào ConfigForm nếu muốn auto-detect
 - `TrendsForm` không giữ lịch sử dữ liệu chart/track khi đóng — mở lại là tích luỹ lại từ đầu (buffer sống
   trong chính instance của control, không lưu trong `ConningDataHub`)
-- `SatelliteForm` chỉ đọc `$GSV`/`$GSA` chuẩn NMEA-0183 — không hiển thị vệ tinh phát tín hiệu hiệu chỉnh vi
-  sai (differential correction/SBAS), cần bản tin độc quyền hãng receiver để làm việc đó
-- DUO GPS: đổi port/baud của task `GPS2` cần restart app để áp dụng, giống mọi thay đổi COM port khác
+- `SatelliteForm` (giờ "GNSS HEALTH / SATELLITE STATUS") chỉ đọc `$GSV`/`$GSA`/`$GGA` chuẩn NMEA-0183 —
+  không hiển thị vệ tinh phát tín hiệu hiệu chỉnh vi sai (differential correction/SBAS), cần bản tin độc
+  quyền hãng receiver để làm việc đó; kênh H6 (receiver/antenna) của PRS-GNSS-01 vì vậy luôn UNKNOWN
+- PRS-GNSS-01: H1/H7 dùng chung 1 timestamp trong `ConningDataHub` (chỉ khác ngưỡng), chưa phải 2 tín
+  hiệu độc lập — xem mục "PRS-GNSS-01" để biết chi tiết
+- PRS-PQE-01: Q7 (cross-PRS) luôn UNKNOWN (chỉ 1 nguồn vị trí), Q6 dùng SOG từ cùng GPS đang đánh giá
+  (không phải nguồn tham chiếu độc lập thật), không có biểu đồ đám mây vị trí — xem mục "PRS-PQE-01"
+- DUO GPS: đã tắt (`#if DUO_GPS_ENABLED`, xem mục "DUO GPS mode") — app hiện chỉ có 1 nguồn GPS
 - `System.Windows.Forms.DataVisualization` là package prerelease chưa có bản ổn định — xem 2 gotcha đã ghi
   trong mục "Radar/Trends window" trước khi đụng vào `TrendChartControl`

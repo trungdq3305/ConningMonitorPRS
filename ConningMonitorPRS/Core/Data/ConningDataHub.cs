@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using ConningMonitorPRS.Core.Models;
 
 namespace ConningMonitorPRS.Core.Data
 {
@@ -34,6 +35,17 @@ namespace ConningMonitorPRS.Core.Data
         private readonly Dictionary<string, (int Count, int AvgSnr, DateTime Updated)> _satellites = new();
         private string _gsaFixType = "";
         private double _pdop, _hdop, _vdop;
+
+        // PRS-GNSS-01 (GNSS health module) — extended GGA fields + evaluator output.
+        private int    _satsUsed;
+        private double _dgpsAgeSec = double.NaN;
+        private string _dgpsStationId = "";
+        private GnssHealthStatus? _gnssHealth;
+
+        // PRS-PQE-01 (position quality module) + combined LÕI DP-OA interpretation.
+        private PqeStatus?  _pqeStatus;
+        private string      _combinedText     = "";
+        private HealthState _combinedSeverity = HealthState.Unknown;
 
         private readonly Dictionary<string, string>   _rawStrings = new();
         private readonly Dictionary<string, DateTime> _lastUpdate = new();
@@ -127,6 +139,31 @@ namespace ConningMonitorPRS.Core.Data
             lock (_lockData) { _gsaFixType = fixType; _pdop = pdop; _hdop = hdop; _vdop = vdop; }
         }
 
+        public void UpdateGgaExtended(int satsUsed, double dgpsAgeSec, string stationId)
+        {
+            lock (_lockData) { _satsUsed = satsUsed; _dgpsAgeSec = dgpsAgeSec; _dgpsStationId = stationId; }
+        }
+
+        // Called by DpOaCore.IngestGnssStatus, not directly by the evaluator or MainForm —
+        // keeps the PRS-GNSS-01 → LÕI DP-OA → HMI ordering from the DP-OA handover doc intact.
+        public void UpdateGnssHealth(GnssHealthStatus status)
+        {
+            lock (_lockData) { _gnssHealth = status; }
+        }
+
+        // Called by DpOaCore.IngestPqeStatus — same ordering rule as UpdateGnssHealth above.
+        public void UpdatePqeStatus(PqeStatus status)
+        {
+            lock (_lockData) { _pqeStatus = status; }
+        }
+
+        // Called by DpOaCore.RecomputeCombined once both PRS-GNSS-01 and PRS-PQE-01 have
+        // reported at least once — doc section 8's combined interpretation.
+        public void UpdateCombinedStatus(string text, HealthState severity)
+        {
+            lock (_lockData) { _combinedText = text; _combinedSeverity = severity; }
+        }
+
         public void UpdateHeavePeriod(double sec)
         {
             lock (_lockData) { _heavePeriodSec = sec; }
@@ -193,6 +230,13 @@ namespace ConningMonitorPRS.Core.Data
                     Pdop           = _pdop,
                     Hdop           = _hdop,
                     Vdop           = _vdop,
+                    SatsUsed       = _satsUsed,
+                    DgpsAgeSec     = _dgpsAgeSec,
+                    DgpsStationId  = _dgpsStationId,
+                    GnssHealth     = _gnssHealth,
+                    PqeStatus        = _pqeStatus,
+                    CombinedText     = _combinedText,
+                    CombinedSeverity = _combinedSeverity,
                 };
             }
         }
@@ -242,6 +286,17 @@ namespace ConningMonitorPRS.Core.Data
         public double Pdop           { get; set; }
         public double Hdop           { get; set; }
         public double Vdop           { get; set; }
+
+        // PRS-GNSS-01 (GNSS health module)
+        public int    SatsUsed       { get; set; }
+        public double DgpsAgeSec     { get; set; } = double.NaN;
+        public string DgpsStationId  { get; set; } = "";
+        public GnssHealthStatus? GnssHealth { get; set; }
+
+        // PRS-PQE-01 (position quality module) + combined LÕI DP-OA interpretation.
+        public PqeStatus?  PqeStatus        { get; set; }
+        public string      CombinedText     { get; set; } = "";
+        public HealthState CombinedSeverity { get; set; } = HealthState.Unknown;
     }
 
     public class SatelliteInfo
